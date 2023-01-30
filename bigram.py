@@ -3,20 +3,24 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 32  # How many independent sequences will we process in parallel?
-block_size = 8  # What is the maximum context length for predictions?
-max_iters = 5000
-eval_interval = 500
-learning_rate = 1e-3
+batch_size = 64  # How many independent sequences will we process in parallel?
+block_size = 256  # What is the maximum context length for predictions?
+max_iters = 1000
+eval_interval = 50
+learning_rate = 3e-4
 device = 'cuda'
-eval_iters = 200
-n_embed = 32  # Number of embeddings
+eval_iters = 50
+n_embed = 384  # Number of embeddings
+n_layer = 6  # Number of transformer layers
+n_heads = 6  # Number of attention heads
+dropout = 0.2
 # ------------
-torch.manual_seed(1337)
-torch.cuda.manual_seed(1337)
+# torch.manual_seed(1337)
+# torch.cuda.manual_seed(1337)
 
 # Load dataset
-with open('input.txt', 'r', encoding='utf-8') as f:
+inputTxt = 'messages'
+with open(f'{inputTxt}.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
@@ -67,9 +71,7 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
         self.blocks = nn.Sequential(
-            Block(n_embed, n_head=4),
-            Block(n_embed, n_head=4),
-            Block(n_embed, n_head=4),
+            *[Block(n_embed, n_head=n_heads) for _ in range(n_layer)],
             nn.LayerNorm(n_embed),
         )
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -143,6 +145,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embed, 4 * n_embed),
             nn.ReLU(),
             nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -156,10 +159,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
 
 
@@ -173,6 +177,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x)
@@ -182,6 +188,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B, T, C) @ (B, C, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # B, T, T
         wei = F.softmax(wei, dim=-1)  # B, T, T
+        wei = self.dropout(wei)
 
         # Perform weighted aggregation of the values
         v = self.value(x)  # B, T, C
@@ -191,25 +198,29 @@ class Head(nn.Module):
 
 bigram_model = BigramLanguageModel()
 bigram_model = bigram_model.to(device)
+bigram_model.load_state_dict(torch.load(f'{inputTxt}-model.pt'))
 
 optimizer = torch.optim.AdamW(bigram_model.parameters(), lr=1e-3)
 
-for iteration in range(max_iters):
-    # Every once in a while evaluate the loss on train and val sets
-    if iteration % eval_interval == 0:
-        losses = estimate_loss()
-        print(f"step {iteration}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-    # Sample a batch of data
-    xb, yb = get_batch('train')
-
-    # Forward pass
-    logits, loss = bigram_model(xb, yb)
-
-    # Evaluate the loss
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+# for iteration in range(max_iters):
+#     # Every once in a while evaluate the loss on train and val sets
+#     if iteration % eval_interval == 0:
+#         losses = estimate_loss()
+#         torch.save(bigram_model.state_dict(), f'{inputTxt}-model.pt')
+#         print(f"step {iteration}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+#
+#     # Sample a batch of data
+#     xb, yb = get_batch('train')
+#
+#     # Forward pass
+#     logits, loss = bigram_model(xb, yb)
+#
+#     # Evaluate the loss
+#     optimizer.zero_grad(set_to_none=True)
+#     loss.backward()
+#     optimizer.step()
 
 test_idx = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(bigram_model.generate(test_idx, max_new_tokens=100)[0].tolist()))
+print(decode(bigram_model.generate(test_idx, max_new_tokens=5000)[0].tolist()))
+
+torch.save(bigram_model.state_dict(), f'{inputTxt}-model.pt')
