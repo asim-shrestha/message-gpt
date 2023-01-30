@@ -5,11 +5,12 @@ from torch.nn import functional as F
 # hyperparameters
 batch_size = 32  # How many independent sequences will we process in parallel?
 block_size = 8  # What is the maximum context length for predictions?
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-2
+max_iters = 5000
+eval_interval = 500
+learning_rate = 1e-3
 device = 'cuda'
 eval_iters = 200
+n_embed = 32  # Number of embeddings
 # ------------
 torch.manual_seed(1337)
 torch.cuda.manual_seed(1337)
@@ -60,15 +61,25 @@ def estimate_loss():
 class BigramLanguageModel(nn.Module):
     token_embedding_table: nn.Embedding
 
-    def __init__(self, input_vocab_size):
+    def __init__(self, ):
         super().__init__()
         # Each token directly reads off the logits for the next token from a lookup table
-        print(input_vocab_size)
-        self.token_embedding_table = nn.Embedding(input_vocab_size, input_vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.sa_heads = MultiHeadAttention(4, n_embed // 4) # 4 heads, 8 dimensions per head
+        self.ffwd = FeedForward(n_embed)
+        self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
+        curr_b, curr_t = idx.shape
+
         # Idx and targets are both (B, T) tensors of integers
-        new_logits = self.token_embedding_table(idx)  # (B, T, C)
+        tok_emb = self.token_embedding_table(idx)  # (B, T, C)
+        pos_emb = self.position_embedding_table(torch.arange(curr_t, device=device))  # (T, C)
+        combined_x = tok_emb + pos_emb  # (B, T, C)
+        combined_x = self.sa_heads(combined_x)  # (B, T, C)
+        combined_x = self.ffwd(combined_x)  # (B, T, C)
+        new_logits = self.lm_head(combined_x)  # (B, T, vocab_size)
 
         if targets is None:
             new_loss = None
@@ -83,8 +94,11 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # Idx is a (B, T) array of indicies in the current context
         for _ in range(max_new_tokens):
+            # Crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
+
             # Get the predictions
-            new_logits, new_loss = self(idx)
+            new_logits, new_loss = self(idx_cond)
 
             # Focus only on the last time step
             new_logits = new_logits[:, -1, :]  # Get last element of the time dimension which is (B, C)
@@ -100,7 +114,56 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
-bigram_model = BigramLanguageModel(vocab_size)
+class FeedForward(nn.Module):
+    """ A simple linear layer followed by non-linearity """
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, n_embed),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MultiHeadAttention(nn.Module):
+    """ Multiple heads of self-attention in parallel """
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+
+
+class Head(nn.Module):
+    """ One head of self attention """
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embed, head_size, bias=False)
+        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+
+        # Compute attention scores
+        wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B, T, C) @ (B, C, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # B, T, T
+        wei = F.softmax(wei, dim=-1)  # B, T, T
+
+        # Perform weighted aggregation of the values
+        v = self.value(x)  # B, T, C
+        out = wei @ v  # B, T, C
+        return out
+
+
+bigram_model = BigramLanguageModel()
 bigram_model = bigram_model.to(device)
 
 optimizer = torch.optim.AdamW(bigram_model.parameters(), lr=1e-3)
